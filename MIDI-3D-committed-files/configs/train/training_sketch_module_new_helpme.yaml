@@ -1,0 +1,164 @@
+name: image2scene
+tag: "finetune-midi"
+exp_root_dir: "/data1/yzh/icme2026/outputs"
+seed: 42
+
+data_cls: "midi.data.multi_object_with_sketch.MultiObjectWithSketchDataModule"
+data:
+  scene_list: "../midi_test_room_ids.json"
+  object_list: "../midi_test_furniture_ids.json"
+  sketch_vision_tower_path: "openai/clip-vit-large-patch14"
+  sketch_vision_tower_patch_size: 14
+  # Surface
+  surface_root_dir: "3d_front/3D-FRONT-TEST-SURFACE"
+  surface_suffix: "npy"
+  num_surface_samples_per_object: 20480
+
+  max_num_instances: 6
+  padding: true
+  num_instances_per_batch: 8
+
+  # Image input
+  image_root_dir: "../3d_front/datasets--huanngzh--3D-Front/snapshots/156fc5312ea613d4e92cbf5da1fddfa61bbad3b2/3D-FRONT-TEST-RENDER"
+  image_prefix: ["render", "rerender"]
+  image_suffix: "webp"
+  idmap_prefix: "semantic"
+  idmap_suffix: "png"
+  background_color: "white"
+  image_names: ["0000", "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010"]
+  height: 512
+  width: 512
+
+  use_scene_image: true
+  remove_scene_bg: false
+
+  # Data processing
+  skip_small_object: true
+  small_image_proportion: 0.001
+
+  ## Mask perturbation
+  morph_perturb: True
+  max_kernel_size: 5
+  p_dilation: 0.5
+
+  # Data augmentation -> mix objaverse
+  do_mix: false
+  do_mix_prob: 0.3
+  mix_scene_list: data/objaverse/object_list_train.json
+  mix_surface_root_dir: data/objaverse/npy_sample
+  mix_image_root_dir: data/objaverse/image
+  mix_surface_suffix: npy
+  mix_image_prefix: render_opaque
+  mix_image_names: ["0000", "0001", "0002", "0003", "0004", "0005"]
+  mix_image_suffix: webp
+
+  train_indices: [0, -1000]
+  val_indices: [-1100, -900]
+  test_indices: [-1000, null]
+
+  batch_size: 1
+  eval_batch_size: 1
+
+  num_workers: 16
+
+system_cls: midi.systems.system_midi.MIDISystem
+system:
+  check_train_every_n_steps: 1000
+  cleanup_after_validation_step: true
+  cleanup_after_test_step: true
+
+  # Model / Adapter
+  pretrained_model_name_or_path: "pretrained_weights/MIDI-3D"
+
+  training_sketch_module_from_scratch: true
+  sketch_fusion_adapter_config:
+    num_dit_layers: 21
+    num_vision_layers: 12
+    dim_dit_latent: 2048
+    dim_vision_latent: 1024
+    patch_size: 14
+    fusion_mode: "specific"
+    dit_layer_seqs: [0,2,4,5,6,8,9,10,12,14,16,18,20]
+    vision_layer_seqs: [0,1,2,3,4,5,6,7,8,9,10,11,12]
+
+    enable_projector: false
+    dim_projected_latent: 768
+
+  sketch_vision_tower_config:
+    select_feature_type: "patch"
+    arbitrary_input_size: False
+    input_size: [224,224]
+    select_layer: "all"
+    dim_vision_latent: 1024
+    name_pretrained: "openai/clip-vit-large-patch14"
+
+
+  ## Attention processor
+  set_self_attn_module_names: ["blocks.8", "blocks.9", "blocks.10", "blocks.11", "blocks.12"]
+
+  ## LoRA
+  transformer_lora_config:
+    r: 64
+    lora_alpha: 32
+    init_lora_weights: true
+    target_modules: ["to_k", "to_q", "to_v", "to_out.0"]
+  image_encoder_2_lora_config:
+    r: 64
+    lora_alpha: 32
+    init_lora_weights: true
+    target_modules: ["projection", "attention.key", "attention.query", "attention.value", "output.dense", "mlp.fc1", "mlp.fc2"]
+  sketch_vision_tower_lora_config:
+    r: 64
+    lora_alpha: 32
+    init_lora_weights: true
+    target_modules: [ "projection", "attention.key", "attention.query", "attention.value", "output.dense", "mlp.fc1", "mlp.fc2" ]
+  # Training
+  image_drop_prob: 0.1
+  new_cond_size: 512
+
+  vae_slicing_length: 5
+  gradient_checkpointing: true
+
+  # Noise sampler
+  weighting_scheme: logit_normal_dist
+
+  # Evaluation
+  eval_seed: 42
+  eval_num_inference_steps: 50
+  eval_guidance_scale: 7.0
+
+  # Others
+  visual_resolution: ${data.height}
+
+  # optimizer definition
+  # you can set different learning rates separately for each group of parameters, but note that if you do this you should specify EVERY trainable parameters
+  optimizer:
+    name: AdamW
+    args:
+      lr: 1e-4
+      betas: [0.9, 0.999]
+      weight_decay: 0.01
+
+  scheduler:
+    name: ConstantLR
+    interval: step
+    args:
+      factor: 1.0
+      total_iters: 9999999
+    milestones: [2000]
+
+trainer:
+  max_epochs: 10
+  log_every_n_steps: 10
+  num_sanity_val_steps: 1
+  check_val_every_n_epoch: 1
+  enable_progress_bar: true
+  precision: bf16-mixed
+  gradient_clip_val: 1.0
+#  strategy: ddp
+  accumulate_grad_batches: 1
+
+checkpoint:
+  save_last: true # whether to save at each validation time
+  save_top_k: -1
+  every_n_epochs: 5 # do not save at all for debug purpose

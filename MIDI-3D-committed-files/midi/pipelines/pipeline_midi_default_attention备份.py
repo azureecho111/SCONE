@@ -1,0 +1,854 @@
+import inspect
+import math
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+
+import numpy as np
+import PIL
+import PIL.Image
+import torch
+import torch.nn.functional as F
+from diffusers.image_processor import PipelineImageInput
+from diffusers.pipelines.pipeline_utils import DiffusionPipeline
+from diffusers.schedulers import FlowMatchEulerDiscreteScheduler  # not sure
+from diffusers.utils import logging
+from diffusers.utils.torch_utils import randn_tensor
+from peft import LoraConfig, get_peft_model_state_dict
+from transformers import (
+    BitImageProcessor,
+    CLIPImageProcessor,
+    CLIPVisionModelWithProjection,
+    Dinov2Model,
+)
+
+from ..inference_utils import generate_dense_grid_points
+from ..loaders import CustomAdapterMixin
+from ..models.attention_processor import MIAttnProcessor2_0, SketchFusionAttnProcessor, SketchFusionAttnProcessor2
+from ..models.autoencoders import TripoSGVAEModel
+from ..models.transformers import TripoSGDiTModel, set_transformer_attn_processor
+from .pipeline_triposg_output import TripoSGPipelineOutput
+from .pipeline_utils import TransformerDiffusionMixin
+from ..sketch.fusion_adapter import SketchFusionAdapter, FusionAdapterConfig
+from ..sketch.sketch_utils import get_sketch_spatial_gating_map, tensor_to_pil_list
+logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+"""
+default attention运行的这一份pipeline
+"""
+# Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.retrieve_timesteps
+def retrieve_timesteps(
+    scheduler,
+    num_inference_steps: Optional[int] = None,
+    device: Optional[Union[str, torch.device]] = None,
+    timesteps: Optional[List[int]] = None,
+    sigmas: Optional[List[float]] = None,
+    **kwargs,
+):
+    """
+    Calls the scheduler's `set_timesteps` method and retrieves timesteps from the scheduler after the call. Handles
+    custom timesteps. Any kwargs will be supplied to `scheduler.set_timesteps`.
+
+    Args:
+        scheduler (`SchedulerMixin`):
+            The scheduler to get timesteps from.
+        num_inference_steps (`int`):
+            The number of diffusion steps used when generating samples with a pre-trained model. If used, `timesteps`
+            must be `None`.
+        device (`str` or `torch.device`, *optional*):
+            The device to which the timesteps should be moved to. If `None`, the timesteps are not moved.
+        timesteps (`List[int]`, *optional*):
+            Custom timesteps used to override the timestep spacing strategy of the scheduler. If `timesteps` is passed,
+            `num_inference_steps` and `sigmas` must be `None`.
+        sigmas (`List[float]`, *optional*):
+            Custom sigmas used to override the timestep spacing strategy of the scheduler. If `sigmas` is passed,
+            `num_inference_steps` and `timesteps` must be `None`.
+
+    Returns:
+        `Tuple[torch.Tensor, int]`: A tuple where the first element is the timestep schedule from the scheduler and the
+        second element is the number of inference steps.
+    """
+    if timesteps is not None and sigmas is not None:
+        raise ValueError(
+            "Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values"
+        )
+    if timesteps is not None:
+        accepts_timesteps = "timesteps" in set(
+            inspect.signature(scheduler.set_timesteps).parameters.keys()
+        )
+        if not accepts_timesteps:
+            raise ValueError(
+                f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
+                f" timestep schedules. Please check whether you are using the correct scheduler."
+            )
+        scheduler.set_timesteps(timesteps=timesteps, device=device, **kwargs)
+        timesteps = scheduler.timesteps
+        num_inference_steps = len(timesteps)
+    elif sigmas is not None:
+        accept_sigmas = "sigmas" in set(
+            inspect.signature(scheduler.set_timesteps).parameters.keys()
+        )
+        if not accept_sigmas:
+            raise ValueError(
+                f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
+                f" sigmas schedules. Please check whether you are using the correct scheduler."
+            )
+        scheduler.set_timesteps(sigmas=sigmas, device=device, **kwargs)
+        timesteps = scheduler.timesteps
+        num_inference_steps = len(timesteps)
+    else:
+        scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
+        timesteps = scheduler.timesteps
+    return timesteps, num_inference_steps
+
+
+class MIDIPipeline(DiffusionPipeline, TransformerDiffusionMixin, CustomAdapterMixin):
+    """
+    Pipeline for image-to-scene generation based on pre-trained shape diffusion.
+    """
+
+    def __init__(
+        self,
+        vae: TripoSGVAEModel,
+        transformer: TripoSGDiTModel,
+        scheduler: FlowMatchEulerDiscreteScheduler,
+        image_encoder_1: CLIPVisionModelWithProjection,
+        image_encoder_2: Dinov2Model,
+        feature_extractor_1: CLIPImageProcessor,
+        feature_extractor_2: BitImageProcessor,
+        sketch_fusion_adapter: SketchFusionAdapter
+    ):
+        super().__init__()
+        """
+        For first time initialization, input sketch_fusion_adapter as a parameter of function "from_pretrained"
+        """
+        # for name, param in transformer.named_parameters():
+        #     print('SECOND',name, '| ', param.device)
+
+        self.register_modules(
+            vae=vae,
+            transformer=transformer,
+            scheduler=scheduler,
+            image_encoder_1=image_encoder_1,
+            image_encoder_2=image_encoder_2,
+            feature_extractor_1=feature_extractor_1,
+            feature_extractor_2=feature_extractor_2,
+            sketch_fusion_adapter=sketch_fusion_adapter
+        )
+
+        self.debug_random_latents = []
+    def load_state_dict(self, state_dict):
+        print("start loading state dict")
+        prefixes = {s.split('.', 1)[0] for s in state_dict.keys() if '.' in s}
+        # print(prefixes)
+        import torch.nn as nn
+        # nn.init.xavier_uniform_(self.transformer.blocks[0].attn_sketch.to_q.weight)
+        targets = [i if "attn_sketch" in i else None for i in state_dict.keys()]
+        transformer_state_dict = {}
+        sketch_adapter_dict = {}
+        # print(targets)
+        for k,v in state_dict.items():
+            if 'transformer' in k and k.startswith('transformer.'):
+                new_key = k[len('transformer.'):]
+                # 浅复制：只复制引用，不复制数据
+                transformer_state_dict[new_key] = v  # 这里value是原始张量的引用
+
+            if 'sketch_fusion_adapter' in k and k.startswith('sketch_fusion_adapter.'):
+                # print("Hello")
+                new_key = k[len('sketch_fusion_adapter.'):]
+                sketch_adapter_dict[new_key] = v
+        # print(targets)
+        # print("transformer.blocks.0.attn_sketch.to_q.weight" in state_dict.keys())
+        self.vae.load_state_dict(
+            state_dict,
+            strict=False
+        )
+        self.transformer.load_state_dict(
+            transformer_state_dict,
+            strict=True
+        )
+        self.image_encoder_1.load_state_dict(
+            state_dict,
+            strict=False
+        )
+        self.image_encoder_2.load_state_dict(
+            state_dict,
+            strict=False
+        )
+        self.sketch_fusion_adapter.load_state_dict(
+            sketch_adapter_dict,
+            strict=False
+        )
+        print("Loading finished.")
+
+    @property
+    def guidance_scale(self):
+        return self._guidance_scale
+
+    @property
+    def do_classifier_free_guidance(self):
+        return self._guidance_scale > 1
+
+    @property
+    def num_timesteps(self):
+        return self._num_timesteps
+
+    @property
+    def attention_kwargs(self):
+        return self._attention_kwargs
+
+    @property
+    def interrupt(self):
+        return self._interrupt
+
+    @property
+    def decode_progressive(self):
+        return self._decode_progressive
+
+    def encode_image_1(self, image, device, num_images_per_prompt):
+        dtype = next(self.image_encoder_1.parameters()).dtype
+
+        if not isinstance(image, torch.Tensor):
+            image = self.feature_extractor_1(image, return_tensors="pt").pixel_values
+
+        image = image.to(device=device, dtype=dtype)
+        image_embeds = self.image_encoder_1(image).image_embeds
+        image_embeds = image_embeds.repeat_interleave(
+            num_images_per_prompt, dim=0
+        ).unsqueeze(1)
+        uncond_image_embeds = torch.zeros_like(image_embeds)
+
+        return image_embeds, uncond_image_embeds
+
+    def encode_image_2(
+        self,
+        image_one,
+        image_two,
+        mask,
+        device,
+        num_images_per_prompt,
+    ):
+        dtype = next(self.image_encoder_2.parameters()).dtype
+
+        images = [image_one, image_two, mask]
+        images_new = []
+        for i, image in enumerate(images):
+            if not isinstance(image, torch.Tensor):
+                if i <= 1:
+                    images_new.append(
+                        self.feature_extractor_2(
+                            image, return_tensors="pt"
+                        ).pixel_values
+                    )
+                else:
+                    image = [
+                        torch.from_numpy(
+                            (np.array(im) / 255.0).astype(np.float32)
+                        ).unsqueeze(0)
+                        for im in image
+                    ]
+                    image = torch.stack(image, dim=0)
+                    images_new.append(
+                        F.interpolate(
+                            image, size=images_new[0].shape[-2:], mode="nearest"
+                        )
+                    )
+
+        image = torch.cat(images_new, dim=1).to(device=device, dtype=dtype)
+        image_embeds = self.image_encoder_2(image).last_hidden_state
+        image_embeds = image_embeds.repeat_interleave(num_images_per_prompt, dim=0)
+        uncond_image_embeds = torch.zeros_like(image_embeds)
+
+        return image_embeds, uncond_image_embeds
+    def get_sketch_fusion_latent(
+            self,
+            sketch_images,
+    ):
+        # @TODO: Need test.
+        # print(type(self.sketch_fusion_adapter))
+        return self.sketch_fusion_adapter(sketch_images)
+
+    def prepare_latents(
+        self,
+        batch_size,
+        num_tokens,
+        num_channels_latents,
+        dtype,
+        device,
+        generator,
+        latents: Optional[torch.Tensor] = None,
+    ):
+        if latents is not None:
+            return latents.to(device=device, dtype=dtype)
+        shape = (batch_size, num_tokens, num_channels_latents)
+        # print(f"###shape:{shape}")
+
+        if isinstance(generator, list) and len(generator) != batch_size:
+            raise ValueError(
+                f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
+                f" size of {batch_size}. Make sure the batch size matches the length of the generators."
+            )
+
+        latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+
+        # if self.debug_random_latents is not None:
+        #     for i in self.debug_random_latents:
+        #         print(f"Similarity: {torch.allclose(i, latents)}")
+        # self.debug_random_latents.append(latents)
+        return latents
+
+    # @TODO: append part about sketch fusion in inference function.
+    @torch.no_grad()
+    def decode_latents(
+        self,
+        id:str,
+        latents: torch.Tensor,
+        sampled_points: torch.Tensor,
+        decode_progressive: bool = False,
+        decode_to_cpu: bool = False,
+        # Params for sampling points
+        bbox_min: np.ndarray = np.array([-1.005, -1.005, -1.005]),
+        bbox_max: np.ndarray = np.array([1.005, 1.005, 1.005]),
+        octree_depth: int = 8,
+        indexing: str = "ij",
+        padding: float = 0.05,
+    ):
+        device, dtype = latents.device, latents.dtype
+        batch_size = latents.shape[0]
+
+        grid_sizes, bbox_sizes, bbox_mins, bbox_maxs = [], [], [], []
+
+        if sampled_points is None:
+            sampled_points, grid_size, bbox_size = generate_dense_grid_points(
+                bbox_min, bbox_max, octree_depth, indexing
+            )
+            sampled_points = torch.FloatTensor(sampled_points).to(
+                device=device, dtype=dtype
+            )
+            sampled_points = sampled_points.unsqueeze(0).expand(batch_size, -1, -1)
+
+            grid_sizes.append(grid_size)
+            bbox_sizes.append(bbox_size)
+            bbox_mins.append(bbox_min)
+            bbox_maxs.append(bbox_max)
+
+        self.vae: TripoSGVAEModel
+        output = self.vae.decode(
+            latents, sampled_points=sampled_points, to_cpu=decode_to_cpu
+        ).sample
+
+        if not decode_progressive:
+            return (output, grid_sizes, bbox_sizes, bbox_mins, bbox_maxs)
+
+        grid_sizes, bbox_sizes, bbox_mins, bbox_maxs = [], [], [], []
+        sampled_points_list = []
+        for i in range(batch_size):
+            sdf_ = output[i].squeeze(-1)  # [num_points]
+            sampled_points_ = sampled_points[i]
+            # print(f'id: {id} sampled points shape:{sampled_points_.shape}, sdf output: {torch.min(sdf_)}')
+
+            occupied_points = sampled_points_[sdf_ <= 0]  # [num_occupied_points, 3]
+
+            if occupied_points.shape[0] == 0:
+                logger.warning(
+                    f"No occupied points found in batch {i}. Using original bounding box."
+                )
+            else:
+                bbox_min = occupied_points.min(dim=0).values
+                bbox_max = occupied_points.max(dim=0).values
+                bbox_min = (bbox_min - padding).float().cpu().numpy()
+                bbox_max = (bbox_max + padding).float().cpu().numpy()
+
+            sampled_points_, grid_size, bbox_size = generate_dense_grid_points(
+                bbox_min, bbox_max, octree_depth, indexing
+            )
+            sampled_points_ = torch.FloatTensor(sampled_points_).to(
+                device=device, dtype=dtype
+            )
+            sampled_points_list.append(sampled_points_)
+
+            grid_sizes.append(grid_size)
+            bbox_sizes.append(bbox_size)
+            bbox_mins.append(bbox_min)
+            bbox_maxs.append(bbox_max)
+
+        sampled_points = torch.stack(sampled_points_list, dim=0)
+
+        # Re-decode the new sampled points
+        output = self.vae.decode(
+            latents, sampled_points=sampled_points, to_cpu=decode_to_cpu
+        ).sample
+
+        return (output, grid_sizes, bbox_sizes, bbox_mins, bbox_maxs)
+
+    @torch.no_grad()
+    def __call__(
+        self,
+        id: str,
+        image: PipelineImageInput,
+        mask: PipelineImageInput,
+        image_scene: PipelineImageInput,
+        sketch_image: List,
+
+        num_inference_steps: int = 50,
+        timesteps: List[int] = None,
+        guidance_scale: float = 7.0,
+        num_images_per_prompt: int = 1,
+        sampled_points: Optional[torch.Tensor] = None,
+        decode_progressive: bool = False,
+        decode_to_cpu: bool = False,
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        latents: Optional[torch.FloatTensor] = None,
+        attention_kwargs: Optional[Dict[str, Any]] = None,
+        callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
+        callback_on_step_end_tensor_inputs: List[str] = ["latents"],
+        output_type: Optional[str] = "mesh_vf",
+        return_dict: bool = True,
+    ):
+        # print(f"############ {}")
+        # 1. Check inputs. Raise error if not correct
+        # TODO
+        self._decode_progressive = decode_progressive
+        self._guidance_scale = guidance_scale
+        self._attention_kwargs = attention_kwargs
+        self._interrupt = False
+        # print(sketch_image)
+
+        processed_sketch_image = self.sketch_fusion_adapter.sketch_tower.preprocessor(images=sketch_image, return_tensors="pt")['pixel_values']
+        preprocessed_sketch_image = tensor_to_pil_list(processed_sketch_image)
+        # Get gating map:
+        # assert len(preprocessed_sketch_image) ==
+
+        gating_map = get_sketch_spatial_gating_map(
+            [preprocessed_sketch_image],
+            self.sketch_fusion_adapter.config.patch_size,
+            concat=True
+        ).to(device=self._execution_device)
+        if isinstance(image, PIL.Image.Image):
+            batch_size = 1
+        elif isinstance(image, list):
+            batch_size = len(image)
+        elif isinstance(image, torch.Tensor):
+            batch_size = image.shape[0]
+        else:
+            raise ValueError("Invalid input type for image")
+
+        device = self._execution_device
+
+        # 3. Encode condition
+        image_embeds_1, negative_image_embeds_1 = self.encode_image_1(
+            image, device, num_images_per_prompt
+        )
+        image_embeds_2, negative_image_embeds_2 = self.encode_image_2(
+            image, image_scene, mask, device, num_images_per_prompt
+        )
+        # print(sketch_image)
+
+        # print(sketch_latents)
+        # print(image_embeds_1.shape)
+        # print(image_embeds_2.shape)
+
+        if self.do_classifier_free_guidance:
+            image_embeds_1 = torch.cat([negative_image_embeds_1, image_embeds_1], dim=0)
+            image_embeds_2 = torch.cat([negative_image_embeds_2, image_embeds_2], dim=0)
+            sketch_image = sketch_image + sketch_image
+            gating_map = torch.cat([gating_map,torch.ones_like(gating_map)], dim=0)
+        sketch_latents = self.get_sketch_fusion_latent(sketch_image)
+
+        # print(f"SHAPE1 : {image_embeds_1.shape} | SHAPE2 : {image_embeds_2.shape}")
+        # 4. Prepare timesteps
+        timesteps, num_inference_steps = retrieve_timesteps(
+            self.scheduler, num_inference_steps, device, timesteps
+        )
+        num_warmup_steps = max(
+            len(timesteps) - num_inference_steps * self.scheduler.order, 0
+        )
+        self._num_timesteps = len(timesteps)
+
+        # 5. Prepare latent variables
+        num_tokens = self.transformer.config.width
+        num_channels_latents = self.transformer.config.in_channels
+        latents = self.prepare_latents(
+            batch_size * num_images_per_prompt,
+            num_tokens,
+            num_channels_latents,
+            image_embeds_1.dtype,
+            device,
+            generator,
+            latents,
+        )
+        # 6. Denoising loop
+        with self.progress_bar(total=num_inference_steps) as progress_bar:
+            for i, t in enumerate(timesteps):
+                if self.interrupt:
+                    continue
+
+                # expand the latents if we are doing classifier free guidance
+                latent_model_input = (
+                    torch.cat([latents] * 2)
+                    if self.do_classifier_free_guidance
+                    else latents
+                )
+                # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+                timestep = t.expand(latent_model_input.shape[0])
+                from torch.profiler import profile, ProfilerActivity
+
+                with profile(activities=[
+                    ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=False) as prof:
+                    # 为了稳定和准确，通常会先运行几次热身 (warm-up)，这里省略
+
+                    # 正式运行 forward
+                    noise_pred = self.transformer(
+                        latent_model_input,
+                        timestep,
+                        encoder_hidden_states=image_embeds_1,
+                        encoder_hidden_states_2=image_embeds_2,
+                        sketch_hidden_states=sketch_latents,
+                        attention_kwargs=attention_kwargs,
+                        return_dict=False,
+                        gating_map=gating_map,
+                    )[0]
+                    torch.cuda.synchronize()
+                # print('HELLO',  prof.key_averages().table(sort_by="cuda_time_total", row_limit=50, max_name_column_width=50))
+                # noise_pred = self.transformer(
+                #     latent_model_input,
+                #     timestep,
+                #     encoder_hidden_states=image_embeds_1,
+                #     encoder_hidden_states_2=image_embeds_2,
+                #     sketch_hidden_states=sketch_latents,
+                #     attention_kwargs=attention_kwargs,
+                #     return_dict=False,
+                #     gating_map=gating_map,
+                # )[0]
+
+                # perform guidance
+                if self.do_classifier_free_guidance:
+                    noise_pred_uncond, noise_pred_image = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond + self.guidance_scale * (
+                        noise_pred_image - noise_pred_uncond
+                    )
+
+                # compute the previous noisy sample x_t -> x_t-1
+                latents_dtype = latents.dtype
+
+                # print(f"ID: {id} | Step {i} | Latents nan count: {torch.isnan(latents).sum().item()} | Noise: {torch.isnan(noise_pred).sum().item()}")
+                latents = self.scheduler.step(
+                    noise_pred, t, latents, return_dict=False
+                )[0]
+                if latents.dtype != latents_dtype:
+                    if torch.backends.mps.is_available():
+                        # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
+                        latents = latents.to(latents_dtype)
+                # @TODO: 这里没搞懂是啥意思，Image embeds每一个step都在变吗？
+                if callback_on_step_end is not None:
+                    # print("HELLO")
+                    callback_kwargs = {}
+                    for k in callback_on_step_end_tensor_inputs:
+                        callback_kwargs[k] = locals()[k]
+                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+
+                    latents = callback_outputs.pop("latents", latents)
+
+                    image_embeds_1 = callback_outputs.pop(
+                        "image_embeds_1", image_embeds_1
+                    )
+                    negative_image_embeds_1 = callback_outputs.pop(
+                        "negative_image_embeds_1", negative_image_embeds_1
+                    )
+                    image_embeds_2 = callback_outputs.pop(
+                        "image_embeds_2", image_embeds_2
+                    )
+                    negative_image_embeds_2 = callback_outputs.pop(
+                        "negative_image_embeds_2", negative_image_embeds_2
+                    )
+
+                # call the callback, if provided
+                if i == len(timesteps) - 1 or (
+                    (i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0
+                ):
+                    progress_bar.update()
+
+        grid_sizes, bbox_sizes, bbox_mins, bbox_maxs = None, None, None, None
+
+        if output_type == "latent":
+            output = latents
+        else:
+            output, grid_sizes, bbox_sizes, bbox_mins, bbox_maxs = self.decode_latents(
+                id,
+                latents,
+                sampled_points=sampled_points,
+                decode_progressive=decode_progressive,
+                decode_to_cpu=decode_to_cpu,
+            )
+
+        # Offload all models
+        self.maybe_free_model_hooks()
+
+        if not return_dict:
+            return (output, grid_sizes, bbox_sizes, bbox_mins, bbox_maxs)
+
+        return TripoSGPipelineOutput(
+            samples=output,
+            grid_sizes=grid_sizes,
+            bbox_sizes=bbox_sizes,
+            bbox_mins=bbox_mins,
+            bbox_maxs=bbox_maxs,
+        )
+
+
+
+    def _init_custom_adapter(
+        self,
+        # Attention processor
+        # @TODO :Note this variable
+        set_self_attn_module_names: Optional[List[str]] = None,
+        set_sketch_attn_module_names: Optional[List[str]] = None,
+        # Image encoder 2
+        pretrained_image_encoder_2_processor_config: Optional[Dict[str, Any]] = None,
+        image_encoder_2_input_channels: int = 7,
+        image_encoder_2_init_projection_method: str = "clone",
+        # LoRA
+        transformer_lora_config: Optional[Dict[str, Any]] = None,
+        image_encoder_1_lora_config: Optional[Dict[str, Any]] = None,
+        image_encoder_2_lora_config: Optional[Dict[str, Any]] = None,
+        sketch_vision_tower_lora_config: Optional[Dict[str, Any]] = None,
+        load_ckpt: bool = False,
+    ):
+
+        # @TODO: Add adapter for sketch vision tower.
+        #   在attn的对其过程，这里不传入lora的config就行，把其他都冻住。
+        # Modify feature extractor 2 if needed
+        # print(pretrained_image_encoder_2_processor_config)
+        # print(self.feature_extractor_2.to_dict())
+        if pretrained_image_encoder_2_processor_config is not None:
+            self.feature_extractor_2 = BitImageProcessor.from_dict(
+                self.feature_extractor_2.to_dict(),
+                **(pretrained_image_encoder_2_processor_config or {}),
+            )
+
+        # Expand the input channels of the image encoder if needed
+        original_num_channels = self.image_encoder_2.config.num_channels
+        if original_num_channels < image_encoder_2_input_channels:
+            image_encoder_2: Dinov2Model = self.image_encoder_2
+            image_encoder_2_config = image_encoder_2.config
+            image_encoder_2_config.num_channels = image_encoder_2_input_channels
+            image_encoder_2_state_dict = image_encoder_2.state_dict()
+            projection_key = "embeddings.patch_embeddings.projection.weight"
+            projection_weight = image_encoder_2_state_dict[projection_key]
+            new_projection_weight = [projection_weight[:, :3]]
+            num_channels_left = image_encoder_2_config.num_channels - 3
+            while num_channels_left > 0:
+                if image_encoder_2_init_projection_method == "clone":
+                    new_projection_weight.append(
+                        projection_weight[
+                            :, : min(original_num_channels, num_channels_left)
+                        ].clone()
+                    )
+                elif image_encoder_2_init_projection_method == "zero":
+                    new_projection_weight.append(
+                        torch.zeros_like(
+                            projection_weight[
+                                :, : min(original_num_channels, num_channels_left)
+                            ]
+                        )
+                    )
+                else:
+                    raise ValueError(
+                        f"Unsupported image_encoder_2_init_projection_method: {image_encoder_2_init_projection_method}"
+                    )
+                num_channels_left -= original_num_channels
+            new_projection_weight = torch.cat(new_projection_weight, dim=1)
+            image_encoder_2_state_dict[projection_key] = new_projection_weight
+
+            self.image_encoder_2 = Dinov2Model(image_encoder_2_config)
+            self.image_encoder_2.load_state_dict(image_encoder_2_state_dict)
+
+        self.image_encoder_2 = self.image_encoder_2.to(self.device, self.dtype)
+
+        # Set attention processor
+        func_default = lambda name, hs, cad, ap: MIAttnProcessor2_0(use_mi=False)
+        set_transformer_attn_processor(  # avoid warning
+            self.transformer,
+            set_self_attn_proc_func=func_default,
+            set_cross_attn_1_proc_func=func_default,
+            set_cross_attn_2_proc_func=func_default,
+            set_sketch_attn_proc_func=func_default
+        )
+        set_transformer_attn_processor(
+            self.transformer,
+            set_self_attn_proc_func=lambda name, hs, cad, ap: MIAttnProcessor2_0(),
+            set_self_attn_module_names=set_self_attn_module_names,
+        )
+
+        # @TODO STAR: Ablation study
+        set_transformer_attn_processor(
+            self.transformer,
+            set_sketch_attn_proc_func=lambda name, hs, cad, ap: SketchFusionAttnProcessor2(),
+            set_sketch_attn_module_names=set_sketch_attn_module_names,
+        )
+        # set_transformer_attn_processor(
+        #     self.transformer,
+        #     set_sketch_attn_proc_func=lambda name, hs, cad, ap: SketchFusionAttnProcessor(),
+        #     set_sketch_attn_module_names=set_sketch_attn_module_names,
+        # )
+        import torch.nn as nn
+        # re_init attention_sketch weight for the first time training
+        if not load_ckpt:
+            with torch.no_grad():
+                for idx, blocks in enumerate(self.transformer.blocks):
+                    if hasattr(blocks, 'attn_sketch'):
+                        blocks.new_attn_scale.fill_(0.5)
+                        for name, module in blocks.attn_sketch.named_modules():
+                            if isinstance(module, nn.Linear):
+                                # nn.init.normal_(module.weight,mean=0.0, std=10.0)
+
+                                nn.init.xavier_uniform_(module.weight)
+                                if module.bias is not None:
+                                    nn.init.zeros_(module.bias)
+
+                for m in self.transformer.gating_intensity_mlp.modules():
+                    if isinstance(m, nn.Linear):
+                        nn.init.xavier_uniform_(m.weight)
+                        # nn.init.normal_(m.weight, mean=0.0, std=10.0)
+
+                        if m.bias is not None:
+                            nn.init.constant_(m.bias, 0.0)
+
+                    elif isinstance(m, nn.Embedding):
+                        nn.init.xavier_uniform_(m.weight)
+
+                if isinstance(self.transformer.gating_intensity_mlp.fc[-2], nn.Linear) and self.transformer.gating_intensity_mlp.fc[-2].bias is not None:
+                    nn.init.normal_(self.transformer.gating_intensity_mlp.fc[-2].weight, mean=0.0, std=1e-2)
+                    self.transformer.gating_intensity_mlp.fc[-2].bias.fill_(torch.logit(torch.tensor(0.5)))
+            print("####### The parameters of attn_sketch and gating_intensity_mlp are reinitialized. This is normal if you train these modules from scratch. Else you should check the pretrained weights are whether loaded correctly.")
+        # re_init gating_intensity_mlp for the first time training.
+
+        # @TODO: Need to reinitialize weights of projectors if use projectors of sketch adapter
+        # LoRA
+        # print()
+        transformer_lora_config = None
+        image_encoder_1_lora_config = None
+        image_encoder_2_lora_config = None
+
+        if transformer_lora_config is not None:
+            self.transformer.add_adapter(LoraConfig(**transformer_lora_config))
+        else:
+            self.transformer.requires_grad_(False)
+            # for param in transformer.parameters():
+            for param in self.transformer.parameters():
+                param.requires_grad = False
+        # self.transformer.train()
+        # self.transformer.train()
+        # self.image_encoder_1.train()
+        # self.image_encoder_2.train()
+        # self.transformer.requires_grad_(True)
+        # self.image_encoder_1.requires_grad_(True)
+        # self.image_encoder_2.requires_grad_(True)
+        # self.sketch_fusion_adapter.requires_grad_(True)
+        if image_encoder_1_lora_config is not None:
+            self.image_encoder_1.add_adapter(LoraConfig(**image_encoder_1_lora_config))
+        else:
+            self.image_encoder_1.requires_grad_(False)
+            for param in self.image_encoder_1.parameters():
+                param.requires_grad = False
+        if image_encoder_2_lora_config is not None:
+            self.image_encoder_2.add_adapter(LoraConfig(**image_encoder_2_lora_config))
+        else:
+            self.image_encoder_2.requires_grad_(False)
+            for param in self.image_encoder_2.parameters():
+                param.requires_grad = False
+        for param in self.vae.parameters():
+            param.requires_grad = False
+        # @TODO: 这里需要注意，adapter里面的projector应该全参数训练。需要用loRA训练的应该是vision tower.
+        # @TODO: 所以我估计这里的lora_config要着重处理一下
+        if sketch_vision_tower_lora_config is not None:
+            self.sketch_fusion_adapter.sketch_tower.add_adapter(LoraConfig(**sketch_vision_tower_lora_config))
+        else:
+            self.sketch_fusion_adapter.sketch_tower.requires_grad_(False)
+
+
+        if image_encoder_1_lora_config is None \
+            and image_encoder_2_lora_config is None:
+            """
+            Process 1: Only train sketch ViT and Sketch Attention for alignment
+            根据这里参数的结果，上面这些模块应该都已经冻结了。现在解冻sketch attention以及sketch vit.
+            """
+            self.sketch_fusion_adapter.sketch_tower.requires_grad_(True)
+            self.transformer.gating_intensity_mlp.requires_grad_(True)
+            for block in self.transformer.blocks:
+                if hasattr(block, 'attn_sketch'):
+                    block.new_attn_scale.requires_grad_(True)
+                    for param in block.attn_sketch.parameters():
+                        param.requires_grad = True
+            self.sketch_fusion_adapter.requires_grad_(True)
+        for name,param in self.transformer.named_parameters():
+            if "lora" in name:
+                print(f" [LORA] {name}")
+            else:
+                if param.requires_grad:
+                    print(f" [FULL] {name}")
+
+
+    def _load_custom_adapter(self, state_dict):
+        parse_state_dict = lambda state_dict, prefix: {
+            k.replace(prefix, ""): v
+            for k, v in state_dict.items()
+            if k.startswith(prefix)
+        }
+        transformer_state_dict = parse_state_dict(state_dict, "transformer.")
+        image_encoder_1_state_dict = parse_state_dict(state_dict, "image_encoder_1.")
+        image_encoder_2_state_dict = parse_state_dict(state_dict, "image_encoder_2.")
+        sketch_vision_tower_state_dict = parse_state_dict(state_dict, "sketch_vision_tower")
+        if len(transformer_state_dict) > 0:
+            self.transformer.load_state_dict(transformer_state_dict, strict=False)
+        if len(image_encoder_1_state_dict) > 0:
+            self.image_encoder_1.load_state_dict(
+                image_encoder_1_state_dict, strict=False
+            )
+        if len(image_encoder_2_state_dict) > 0:
+            self.image_encoder_2.load_state_dict(
+                image_encoder_2_state_dict, strict=False
+            )
+        if len(sketch_vision_tower_state_dict) > 0:
+            self.sketch_vision_tower.load_state_dict(
+                sketch_vision_tower_state_dict, strict=False
+            )
+
+    def _save_custom_adapter(
+        self,
+        include_keys: Optional[List[str]] = None,
+        exclude_keys: Optional[List[str]] = None,
+    ):
+        def include_fn(k):
+            is_included = False
+
+            if include_keys is not None:
+                is_included = is_included or any([key in k for key in include_keys])
+            if exclude_keys is not None:
+                is_included = is_included and not any(
+                    [key in k for key in exclude_keys]
+                )
+
+            return is_included
+
+        parse_state_dict = lambda state_dict, prefix: {
+            prefix + k: v for k, v in state_dict.items() if include_fn(k)
+        }
+        transformer_state_dict = parse_state_dict(
+            self.transformer.state_dict(), "transformer."
+        )
+        image_encoder_1_state_dict = parse_state_dict(
+            self.image_encoder_1.state_dict(), "image_encoder_1."
+        )
+        image_encoder_2_state_dict = parse_state_dict(
+            self.image_encoder_2.state_dict(), "image_encoder_2."
+        )
+        sketch_vision_tower_state_dict = parse_state_dict(
+            self.sketch_vision_tower.state_dict(), "sketch_vision_tower"
+        )
+        state_dict = {
+            **transformer_state_dict,
+            **image_encoder_1_state_dict,
+            **image_encoder_2_state_dict,
+            **sketch_vision_tower_state_dict
+        }
+
+        return state_dict

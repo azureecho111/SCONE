@@ -1,0 +1,49 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+*.so
+
+# Python / tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
+
+# Logs and experiment outputs
+logs/
+outputs/
+wandb/
+lightning_logs/
+tmp/
+MIDI-3D-committed-files/tmp/
+MIDI-3D-committed-files/outputs/
+MIDI-3D-committed-files/assets_library/
+
+# Model weights and downloaded data
+*.ckpt
+*.pth
+*.pt
+*.safetensors
+*.tar
+*.tar.gz
+*.zip
+*.partaa
+*.partab
+*.partac
+pretrained_weights/
+checkpoints/
+3d_front/
+models/
+MIDI-3D-committed-files/pretrained_weights/
+MIDI-3D-committed-files/checkpoints/
+MIDI-3D-committed-files/3d_front/
+MIDI-3D-committed-files/models/
+
+# Generated 3D assets
+*.glb
+*.gltf
+*.obj
+*.ply
